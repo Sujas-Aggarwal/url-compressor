@@ -167,3 +167,69 @@ func TestPathRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestPathCodec(t *testing.T) {
+	tests := []string{
+		"",
+		"/",
+		"/api",
+		"/api/v1",
+		"/users/12345",
+		"/products/iphone-17",
+		"/api/v2/users/12345",
+		"/products//phones",
+		"/products/phones/",
+		"products/phones",
+	}
+
+	for _, input := range tests {
+		t.Run(input, func(t *testing.T) {
+			path, err := parsePath(input)
+			if err != nil {
+				t.Fatalf(
+					"parsePath() failed: %v",
+					err,
+				)
+			}
+
+			writer := NewBitWriter()
+
+			if err := encodePath(writer, path); err != nil {
+				t.Fatalf(
+					"encodePath() failed: %v",
+					err,
+				)
+			}
+
+			reader := NewBitReader(
+				writer.Bytes(),
+				writer.BitLen(),
+			)
+
+			decoded, err := decodePath(reader)
+			if err != nil {
+				t.Fatalf(
+					"decodePath() failed: %v",
+					err,
+				)
+			}
+
+			got := decoded.String()
+
+			if got != input {
+				t.Fatalf(
+					"expected %q, got %q",
+					input,
+					got,
+				)
+			}
+
+			if reader.Remaining() != 0 {
+				t.Fatalf(
+					"expected 0 remaining bits, got %d",
+					reader.Remaining(),
+				)
+			}
+		})
+	}
+}
