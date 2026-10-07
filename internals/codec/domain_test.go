@@ -157,3 +157,94 @@ func TestParseDomainLabelTooLong(t *testing.T) {
 		t.Fatal("expected error for label longer than 63 characters")
 	}
 }
+
+func TestDomainCodec(t *testing.T) {
+	tests := []string{
+		"example.com",
+		"www.youtube.com",
+		"api.v2.example.co.uk",
+		"localhost",
+		"cdn.assets.example.com",
+	}
+
+	for _, input := range tests {
+		t.Run(input, func(t *testing.T) {
+			domain, err := parseDomain(input)
+			if err != nil {
+				t.Fatalf("parseDomain() error = %v", err)
+			}
+
+			writer := NewBitWriter()
+
+			if err := encodeDomain(writer, domain); err != nil {
+				t.Fatalf("encodeDomain() error = %v", err)
+			}
+
+			reader := NewBitReader(
+				writer.Bytes(),
+				writer.BitLen(),
+			)
+
+			decoded, err := decodeDomain(reader)
+			if err != nil {
+				t.Fatalf("decodeDomain() error = %v", err)
+			}
+
+			got := decoded.String()
+
+			if got != input && got != input+"." {
+				t.Fatalf(
+					"expected %q, got %q",
+					input,
+					got,
+				)
+			}
+
+			if reader.Remaining() != 0 {
+				t.Fatalf(
+					"expected 0 remaining bits, got %d",
+					reader.Remaining(),
+				)
+			}
+		})
+	}
+}
+
+func TestDomainCodecSize(t *testing.T) {
+	domain, err := parseDomain("www.youtube.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writer := NewBitWriter()
+
+	if err := encodeDomain(writer, domain); err != nil {
+		t.Fatal(err)
+	}
+	// label count                 5 bits
+
+	// www
+	// dictionary marker         1 bit
+	// token                     3 bits
+	// 							= 4
+
+	// youtube
+	// raw marker                1 bit
+	// length                    6 bits
+	// data                      7 × 8
+	// 							= 63
+
+	// com
+	// dictionary marker         1 bit
+	// token                     3 bits
+	// 							= 4
+	expected := uint64(76)
+
+	if writer.BitLen() != expected {
+		t.Fatalf(
+			"expected %d bits, got %d",
+			expected,
+			writer.BitLen(),
+		)
+	}
+}
