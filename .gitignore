@@ -10,3 +10,4 @@ __pycache__
 *.txt
 *.json
 *.csv
+corpus/raw/*

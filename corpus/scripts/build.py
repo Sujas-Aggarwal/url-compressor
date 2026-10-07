@@ -3,12 +3,13 @@
 import argparse
 import gzip
 import json
+import math
 import os
 import threading
 import time
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import duckdb
 
@@ -24,11 +25,11 @@ FINAL_FILE = RAW_DIR / "commoncrawl-tranco.txt"
 TRANCO_DB = RAW_DIR / "tranco.duckdb"
 
 DEFAULT_CRAWL = "CC-MAIN-2026-39"
-
-DEFAULT_TARGET = 1_000_000
+DEFAULT_TARGET = 10_000_000
 DEFAULT_WORKERS = 8
 DEFAULT_CANDIDATES_PER_PARTITION = 100_000
 DEFAULT_DOMAIN_QUOTA = 50
+DEFAULT_OVERSAMPLE = 3.0
 
 print_lock = threading.Lock()
 
@@ -43,13 +44,13 @@ def log(message: str) -> None:
 
 
 def sql_string(value: str) -> str:
-    """
-    Safely turn a Python string into a SQL string literal.
-    """
+    """Safely turn a Python string into a SQL string literal."""
     return "'" + value.replace("'", "''") + "'"
 
 
 def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
     tmp = STATE_FILE.with_suffix(".tmp")
 
     with tmp.open("w", encoding="utf-8") as f:
@@ -74,11 +75,47 @@ def load_state(crawl: str) -> dict:
     if state.get("crawl") != crawl:
         raise RuntimeError(
             f"Existing state belongs to {state.get('crawl')}, "
-            f"but requested crawl is {crawl}.\n"
+            f"but requested crawl is {crawl}. "
             f"Use --reset to start again."
         )
 
+    state.setdefault("partitions", [])
+    state.setdefault("completed", {})
+
     return state
+
+
+def completed_candidate_count(state: dict) -> int:
+    """
+    Count candidates from completed shards that actually still exist.
+
+    This deliberately does not blindly trust the JSON state file.
+    """
+    total = 0
+
+    for result in state.get("completed", {}).values():
+        shard_file = result.get("file")
+        rows = result.get("rows", 0)
+
+        if not shard_file:
+            continue
+
+        shard_path = ROOT / shard_file
+
+        if shard_path.exists():
+            total += int(rows)
+
+    return total
+
+
+def cleanup_stale_temp_files() -> None:
+    SHARD_DIR.mkdir(parents=True, exist_ok=True)
+
+    for path in SHARD_DIR.glob("*.tmp.parquet"):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 # ============================================================================
@@ -107,18 +144,14 @@ def download_manifest(crawl: str) -> list[str]:
     ]
 
     if not paths:
-        raise RuntimeError(
-            "Common Crawl manifest is empty"
-        )
+        raise RuntimeError("Common Crawl manifest is empty")
 
     urls = [
         f"{BASE_URL}/{path}"
         for path in paths
     ]
 
-    log(
-        f"Found {len(urls)} parquet partitions"
-    )
+    log(f"Found {len(urls)} parquet partitions")
 
     return urls
 
@@ -128,45 +161,43 @@ def download_manifest(crawl: str) -> list[str]:
 # ============================================================================
 
 def prepare_tranco_db(tranco_csv: Path) -> None:
-
     if TRANCO_DB.exists():
+        log(f"Using existing Tranco database: {TRANCO_DB}")
         return
 
     log("")
     log("Creating local Tranco database...")
     log(f"Source: {tranco_csv}")
 
-    conn = duckdb.connect(
-        str(TRANCO_DB)
-    )
+    conn = duckdb.connect(str(TRANCO_DB))
 
     try:
+        csv_sql = sql_string(str(tranco_csv))
 
         conn.execute(
-            """
+            f"""
             CREATE TABLE tranco AS
             SELECT
                 CAST(column0 AS INTEGER) AS rank,
                 lower(
                     regexp_replace(
                         trim(column1),
-                        '\\.$',
+                        '\\\\.$',
                         ''
                     )
                 ) AS domain
             FROM read_csv(
-                ?,
+                {csv_sql},
                 header = false,
-                columns = {
+                columns = {{
                     'column0': 'VARCHAR',
                     'column1': 'VARCHAR'
-                }
+                }}
             )
             WHERE column0 ~ '^[0-9]+$'
               AND column1 IS NOT NULL
               AND length(trim(column1)) > 0
-            """,
-            [str(tranco_csv)],
+            """
         )
 
         conn.execute(
@@ -177,15 +208,15 @@ def prepare_tranco_db(tranco_csv: Path) -> None:
         )
 
         count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM tranco
-            """
+            "SELECT COUNT(*) FROM tranco"
         ).fetchone()[0]
 
-        log(
-            f"Loaded {count:,} Tranco domains"
-        )
+        if count == 0:
+            raise RuntimeError(
+                "Tranco CSV produced zero valid domains"
+            )
+
+        log(f"Loaded {count:,} Tranco domains")
 
     finally:
         conn.close()
@@ -200,7 +231,6 @@ def collect_partition(
     parquet_url: str,
     candidates_per_partition: int,
 ) -> dict:
-
     shard_path = SHARD_DIR / (
         f"shard-{partition_id:04d}.parquet"
     )
@@ -218,42 +248,21 @@ def collect_partition(
     if temp_path.exists():
         temp_path.unlink()
 
+    if shard_path.exists():
+        raise RuntimeError(
+            f"Refusing to overwrite existing shard: "
+            f"{shard_path}"
+        )
+
     conn = duckdb.connect(
         str(TRANCO_DB),
         read_only=True,
     )
 
     try:
-
-        # --------------------------------------------------------------------
-        # IMPORTANT:
-        #
-        # Do NOT use ? parameters inside this COPY statement.
-        #
-        # DuckDB can bind COPY parameters in surprising ways, which previously
-        # caused:
-        #
-        #   read_parquet(INTEGER)
-        #
-        # and:
-        #
-        #   No files found that match "100000"
-        #
-        # All values below originate from our own manifest/config, so we
-        # construct safe SQL literals explicitly.
-        # --------------------------------------------------------------------
-
-        parquet_sql = sql_string(
-            parquet_url
-        )
-
-        output_sql = sql_string(
-            str(temp_path)
-        )
-
-        limit = int(
-            candidates_per_partition
-        )
+        parquet_sql = sql_string(parquet_url)
+        output_sql = sql_string(str(temp_path))
+        limit = int(candidates_per_partition)
 
         query = f"""
             COPY (
@@ -284,9 +293,9 @@ def collect_partition(
                       SELECT 1
                       FROM tranco t
                       WHERE t.domain =
-                            lower(
-                                url_host_registered_domain
-                            )
+                          lower(
+                              url_host_registered_domain
+                          )
                   )
 
                 ORDER BY hash(url)
@@ -304,13 +313,18 @@ def collect_partition(
 
         conn.execute(query)
 
+        if not temp_path.exists():
+            raise RuntimeError(
+                "Common Crawl query completed but shard "
+                f"was not created: {temp_path}"
+            )
+
         # Atomic completion.
         os.replace(
             temp_path,
             shard_path,
         )
 
-        # Count rows in the completed shard.
         shard_sql = sql_string(
             str(shard_path)
         )
@@ -337,13 +351,12 @@ def collect_partition(
             "file": str(
                 shard_path.relative_to(ROOT)
             ),
-            "rows": count,
+            "rows": int(count),
             "elapsed": elapsed,
             "parquet_url": parquet_url,
         }
 
     except Exception as exc:
-
         if temp_path.exists():
             temp_path.unlink()
 
@@ -366,16 +379,13 @@ def build_final_corpus(
     target: int,
     domain_quota: int,
 ) -> int:
-
     log("")
     log("=" * 70)
     log("BUILDING FINAL CORPUS")
     log("=" * 70)
 
     shard_files = sorted(
-        SHARD_DIR.glob(
-            "shard-*.parquet"
-        )
+        SHARD_DIR.glob("shard-*.parquet")
     )
 
     if not shard_files:
@@ -384,7 +394,7 @@ def build_final_corpus(
         )
 
     log(
-        f"Candidate shards: {len(shard_files)}"
+        f"Candidate shards: {len(shard_files):,}"
     )
 
     conn = duckdb.connect(
@@ -392,15 +402,14 @@ def build_final_corpus(
     )
 
     try:
-
-        # --------------------------------------------------------------------
-        # Build a SQL array containing every shard.
-        # --------------------------------------------------------------------
-
         shard_sql = ", ".join(
             sql_string(str(path))
             for path in shard_files
         )
+
+        # --------------------------------------------------------------------
+        # All candidate URLs
+        # --------------------------------------------------------------------
 
         conn.execute(
             f"""
@@ -433,7 +442,7 @@ def build_final_corpus(
         )
 
         # --------------------------------------------------------------------
-        # Exact URL deduplication.
+        # Exact URL deduplication
         # --------------------------------------------------------------------
 
         conn.execute(
@@ -475,15 +484,16 @@ def build_final_corpus(
         )
 
         # --------------------------------------------------------------------
-        # Domain quota + structural diversity.
+        # Domain quota + structural diversity
         #
-        # Prefer URLs containing:
+        # Within each domain we prefer:
         #
-        #   - queries
+        #   - URLs with query strings
         #   - longer paths
         #   - deeper paths
+        #   - slightly longer URLs
         #
-        # while still using hash(url) as a deterministic tie-breaker.
+        # hash(url) provides a deterministic final tie-breaker.
         # --------------------------------------------------------------------
 
         quota = int(domain_quota)
@@ -499,6 +509,7 @@ def build_final_corpus(
                     PARTITION BY domain
 
                     ORDER BY
+
                         (
                             CASE
                                 WHEN url_query IS NOT NULL
@@ -534,25 +545,54 @@ def build_final_corpus(
                             +
 
                             length(url) / 1000.0
+                        ) DESC,
 
-                            +
+                        hash(url)
 
-                            hash(url)
-                                / 9223372036854775808.0
-                        ) DESC
                 ) AS domain_rank
 
             FROM deduplicated
             """
         )
 
+        eligible_count = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM ranked
+            WHERE domain_rank <= {quota}
+            """
+        ).fetchone()[0]
+
+        log(
+            f"Eligible after quota: "
+            f"{eligible_count:,}"
+        )
+
+        # Not enough candidates after applying the domain quota.
+        #
+        # We deliberately DO NOT replace the final file in this case.
+        # The caller will collect more partitions and retry.
+        if eligible_count < target:
+            log(
+                f"Final corpus is short by "
+                f"{target - eligible_count:,} URLs."
+            )
+
+            return int(eligible_count)
+
         # --------------------------------------------------------------------
-        # Final output.
+        # Export exactly `target` URLs.
+        #
+        # A tab delimiter with one column gives us one URL per line without
+        # adding CSV quotes around URLs containing commas.
         # --------------------------------------------------------------------
 
         tmp_output = FINAL_FILE.with_suffix(
             ".tmp"
         )
+
+        if tmp_output.exists():
+            tmp_output.unlink()
 
         output_sql = sql_string(
             str(tmp_output)
@@ -577,57 +617,70 @@ def build_final_corpus(
             (
                 FORMAT CSV,
                 HEADER false,
+                DELIMITER '\\t',
                 QUOTE ''
             )
             """
         )
 
+        if not tmp_output.exists():
+            raise RuntimeError(
+                "Final corpus export did not create "
+                f"{tmp_output}"
+            )
+
+        # Atomic final corpus replacement.
         os.replace(
             tmp_output,
             FINAL_FILE,
         )
 
         # --------------------------------------------------------------------
-        # Final statistics.
+        # Validate final output.
         # --------------------------------------------------------------------
-
-        final_sql = sql_string(
-            str(FINAL_FILE)
-        )
 
         final_count = conn.execute(
             f"""
             SELECT COUNT(*)
+
             FROM read_csv(
-                {final_sql},
-                columns = {
+                {sql_string(str(FINAL_FILE))},
+
+                columns = {{
                     'url': 'VARCHAR'
-                },
+                }},
+
                 header = false,
+                delimiter = '\\t',
                 quote = ''
             )
             """
         ).fetchone()[0]
 
+        if final_count != target:
+            raise RuntimeError(
+                f"Final corpus count mismatch: "
+                f"expected {target:,}, "
+                f"got {final_count:,}"
+            )
+
+        # Count domains represented by exactly the same final selection.
         domain_count = conn.execute(
             f"""
             SELECT COUNT(DISTINCT domain)
 
-            FROM ranked
+            FROM (
+                SELECT
+                    domain
 
-            WHERE domain_rank <= {quota}
+                FROM ranked
 
-              AND url IN (
-                  SELECT url
-                  FROM read_csv(
-                      {final_sql},
-                      columns = {
-                          'url': 'VARCHAR'
-                      },
-                      header = false,
-                      quote = ''
-                  )
-              )
+                WHERE domain_rank <= {quota}
+
+                ORDER BY hash(url)
+
+                LIMIT {int(target)}
+            )
             """
         ).fetchone()[0]
 
@@ -646,10 +699,229 @@ def build_final_corpus(
         )
         log("=" * 70)
 
-        return final_count
+        return int(final_count)
 
     finally:
         conn.close()
+
+
+# ============================================================================
+# Target-aware collection scheduler
+# ============================================================================
+
+def collect_until_target(
+    state: dict,
+    target_candidates: int,
+    workers: int,
+    candidates_per_partition: int,
+) -> bool:
+    """
+    Collect partitions until the candidate target is reached.
+
+    IMPORTANT:
+    We never submit the entire pending partition list.
+
+    At most `workers` partitions are in flight, and the number of in-flight
+    partitions is also bounded by the number needed to reach the target.
+
+    This is what fixes the old "target=1000 but all 900 partitions run"
+    behavior.
+    """
+
+    completed = state.setdefault(
+        "completed",
+        {},
+    )
+
+    pending = [
+        partition
+
+        for partition in state["partitions"]
+
+        if str(partition["id"]) not in completed
+    ]
+
+    current_candidates = completed_candidate_count(
+        state
+    )
+
+    log("")
+    log(
+        f"Existing completed candidates: "
+        f"{current_candidates:,}"
+    )
+
+    log(
+        f"Candidate target: "
+        f"{target_candidates:,}"
+    )
+
+    log(
+        f"Pending partitions: "
+        f"{len(pending):,}"
+    )
+
+    if current_candidates >= target_candidates:
+        log(
+            "Candidate target already reached."
+        )
+        return True
+
+    if not pending:
+        log(
+            "No pending partitions remain."
+        )
+        return False
+
+    executor = ThreadPoolExecutor(
+        max_workers=workers
+    )
+
+    futures = {}
+
+    pending_index = 0
+
+    def desired_inflight() -> int:
+        """
+        Number of partitions worth having in flight.
+
+        Example:
+            target remaining = 1,000
+            candidates/partition = 100,000
+
+        => only ONE partition is submitted.
+
+        For a large target, the pool expands to `workers`.
+        """
+
+        remaining = max(
+            0,
+            target_candidates - current_candidates,
+        )
+
+        partitions_needed = max(
+            1,
+            math.ceil(
+                remaining /
+                candidates_per_partition
+            ),
+        )
+
+        return min(
+            workers,
+            partitions_needed,
+        )
+
+    def submit_more() -> None:
+        nonlocal pending_index
+
+        desired = desired_inflight()
+
+        while (
+            len(futures) < desired
+            and pending_index < len(pending)
+        ):
+            partition = pending[pending_index]
+            pending_index += 1
+
+            future = executor.submit(
+                collect_partition,
+
+                int(partition["id"]),
+
+                partition["url"],
+
+                candidates_per_partition,
+            )
+
+            futures[future] = partition
+
+            log(
+                f"[scheduler] submitted partition "
+                f"{int(partition['id']):04d} "
+                f"({len(futures)}/{desired} in flight)"
+            )
+
+    try:
+        submit_more()
+
+        while futures:
+            done, _ = wait(
+                futures,
+                return_when=FIRST_COMPLETED,
+            )
+
+            for future in done:
+                partition = futures.pop(
+                    future
+                )
+
+                partition_id = int(
+                    partition["id"]
+                )
+
+                try:
+                    result = future.result()
+
+                    completed[
+                        str(partition_id)
+                    ] = result
+
+                    current_candidates += int(
+                        result["rows"]
+                    )
+
+                    # Checkpoint immediately after every shard.
+                    save_state(state)
+
+                    log(
+                        f"[checkpoint] "
+                        f"partition "
+                        f"{partition_id:04d} saved | "
+                        f"candidates="
+                        f"{current_candidates:,}/"
+                        f"{target_candidates:,}"
+                    )
+
+                except Exception as exc:
+                    # Failed partitions are intentionally NOT added to
+                    # `completed`. They remain retryable on the next run.
+                    log(
+                        f"[partition "
+                        f"{partition_id:04d}] "
+                        f"FAILED: {exc}"
+                    )
+
+            if current_candidates >= target_candidates:
+                log(
+                    "Candidate target reached; "
+                    "no new partitions will be submitted."
+                )
+                break
+
+            submit_more()
+
+    except KeyboardInterrupt:
+        log("")
+        log(
+            "Interrupted. Saving completed shard state..."
+        )
+
+        save_state(state)
+
+        raise
+
+    finally:
+        # Let already-running partition jobs finish cleanly.
+        #
+        # This means Ctrl+C does not leave half-written Parquet files behind.
+        executor.shutdown(
+            wait=True
+        )
+
+    return (
+        current_candidates >= target_candidates
+    )
 
 
 # ============================================================================
@@ -657,7 +929,6 @@ def build_final_corpus(
 # ============================================================================
 
 def main() -> None:
-
     parser = argparse.ArgumentParser(
         description=(
             "Build a large, Tranco-driven, "
@@ -675,7 +946,7 @@ def main() -> None:
         "--crawl",
         default=DEFAULT_CRAWL,
         help=(
-            f"Common Crawl crawl "
+            "Common Crawl crawl "
             f"(default: {DEFAULT_CRAWL})"
         ),
     )
@@ -685,7 +956,7 @@ def main() -> None:
         type=int,
         default=DEFAULT_TARGET,
         help=(
-            f"Final URL target "
+            "Final URL target "
             f"(default: {DEFAULT_TARGET:,})"
         ),
     )
@@ -695,7 +966,7 @@ def main() -> None:
         type=int,
         default=DEFAULT_WORKERS,
         help=(
-            f"Parallel workers "
+            "Parallel workers "
             f"(default: {DEFAULT_WORKERS})"
         ),
     )
@@ -706,7 +977,8 @@ def main() -> None:
         default=DEFAULT_CANDIDATES_PER_PARTITION,
         help=(
             "Maximum candidates per partition "
-            f"(default: {DEFAULT_CANDIDATES_PER_PARTITION:,})"
+            f"(default: "
+            f"{DEFAULT_CANDIDATES_PER_PARTITION:,})"
         ),
     )
 
@@ -721,12 +993,61 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--oversample",
+        type=float,
+        default=DEFAULT_OVERSAMPLE,
+        help=(
+            "Candidate oversampling multiplier "
+            "before final selection "
+            f"(default: "
+            f"{DEFAULT_OVERSAMPLE:g})"
+        ),
+    )
+
+    parser.add_argument(
         "--reset",
         action="store_true",
-        help="Delete previous state and shards",
+        help=(
+            "Delete previous state, Tranco DB, "
+            "final corpus, and shards"
+        ),
     )
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------------
+    # Validate arguments.
+    # ------------------------------------------------------------------------
+
+    if args.target <= 0:
+        parser.error(
+            "--target must be greater than 0"
+        )
+
+    if args.workers <= 0:
+        parser.error(
+            "--workers must be greater than 0"
+        )
+
+    if args.candidates_per_partition <= 0:
+        parser.error(
+            "--candidates-per-partition "
+            "must be greater than 0"
+        )
+
+    if args.domain_quota <= 0:
+        parser.error(
+            "--domain-quota must be greater than 0"
+        )
+
+    if args.oversample < 1.0:
+        parser.error(
+            "--oversample must be at least 1.0"
+        )
+
+    # ------------------------------------------------------------------------
+    # Directories.
+    # ------------------------------------------------------------------------
 
     RAW_DIR.mkdir(
         parents=True,
@@ -744,16 +1065,18 @@ def main() -> None:
 
     if not tranco_csv.exists():
         raise FileNotFoundError(
-            f"Tranco CSV not found: {tranco_csv}"
+            f"Tranco CSV not found: "
+            f"{tranco_csv}"
         )
 
     # ------------------------------------------------------------------------
-    # Reset
+    # Reset.
     # ------------------------------------------------------------------------
 
     if args.reset:
-
-        log("RESETTING CORPUS")
+        log(
+            "RESETTING CORPUS"
+        )
 
         if STATE_FILE.exists():
             STATE_FILE.unlink()
@@ -765,10 +1088,13 @@ def main() -> None:
             FINAL_FILE.unlink()
 
         for path in SHARD_DIR.glob("*"):
-            path.unlink()
+            if path.is_file():
+                path.unlink()
+
+    cleanup_stale_temp_files()
 
     # ------------------------------------------------------------------------
-    # Tranco
+    # Tranco.
     # ------------------------------------------------------------------------
 
     prepare_tranco_db(
@@ -776,7 +1102,7 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------------
-    # State
+    # State.
     # ------------------------------------------------------------------------
 
     state = load_state(
@@ -784,183 +1110,230 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------------
-    # Common Crawl manifest
+    # Common Crawl manifest.
     # ------------------------------------------------------------------------
 
     parquet_urls = download_manifest(
         args.crawl
     )
 
-    # ------------------------------------------------------------------------
-    # Save exact partition list.
-    # ------------------------------------------------------------------------
+    manifest_partitions = [
+        {
+            "id": index,
+            "url": url,
+        }
 
+        for index, url
+        in enumerate(parquet_urls)
+    ]
+
+    # First run: persist the exact manifest.
     if not state["partitions"]:
-
-        state["partitions"] = [
-            {
-                "id": index,
-                "url": url,
-            }
-
-            for index, url
-            in enumerate(parquet_urls)
-        ]
+        state["partitions"] = (
+            manifest_partitions
+        )
 
         state["completed"] = {}
 
         save_state(state)
+
+    # Resume: refuse to silently mix manifests.
+    elif state["partitions"] != manifest_partitions:
+        raise RuntimeError(
+            "Common Crawl manifest differs from "
+            "the manifest stored in "
+            "tranco_state.json. Refusing to mix "
+            "partition sets. Use --reset if you "
+            "intentionally want a fresh corpus."
+        )
 
     completed = state.setdefault(
         "completed",
         {},
     )
 
-    pending = [
-        partition
+    # ------------------------------------------------------------------------
+    # Remove completion records whose Parquet files no longer exist.
+    # ------------------------------------------------------------------------
 
-        for partition
-        in state["partitions"]
+    stale_ids = []
 
-        if str(partition["id"])
-        not in completed
-    ]
+    for partition_id, result in completed.items():
+        shard_file = result.get(
+            "file"
+        )
+
+        if (
+            not shard_file
+            or not (
+                ROOT / shard_file
+            ).exists()
+        ):
+            stale_ids.append(
+                partition_id
+            )
+
+    for partition_id in stale_ids:
+        del completed[
+            partition_id
+        ]
+
+    if stale_ids:
+        save_state(state)
+
+        log(
+            f"Removed {len(stale_ids)} "
+            "stale completion entries "
+            "whose shard files were missing."
+        )
+
+    # ------------------------------------------------------------------------
+    # Candidate target.
+    # ------------------------------------------------------------------------
+
+    candidate_target = math.ceil(
+        args.target *
+        args.oversample
+    )
+
+    # ------------------------------------------------------------------------
+    # Configuration summary.
+    # ------------------------------------------------------------------------
 
     log("")
     log("=" * 70)
     log("COMMON CRAWL COLLECTION")
     log("=" * 70)
+
     log(
-        f"Crawl:                 {args.crawl}"
+        f"Crawl:                  "
+        f"{args.crawl}"
     )
+
     log(
-        f"Tranco:                {tranco_csv}"
+        f"Tranco:                 "
+        f"{tranco_csv}"
     )
+
     log(
-        f"Final target:          {args.target:,}"
+        f"Final target:           "
+        f"{args.target:,}"
     )
+
     log(
-        f"Workers:               {args.workers}"
+        f"Candidate target:       "
+        f"{candidate_target:,}"
     )
+
     log(
-        f"Partitions:            "
-        f"{len(state['partitions'])}"
+        f"Oversample:             "
+        f"{args.oversample:g}x"
     )
+
     log(
-        f"Completed:             "
-        f"{len(completed)}"
+        f"Workers:                "
+        f"{args.workers}"
     )
+
     log(
-        f"Pending:               "
-        f"{len(pending)}"
+        f"Partitions:             "
+        f"{len(state['partitions']):,}"
     )
+
     log(
-        f"Candidates/partition:  "
+        f"Completed:              "
+        f"{len(completed):,}"
+    )
+
+    log(
+        f"Candidates/partition:   "
         f"{args.candidates_per_partition:,}"
     )
+
     log(
-        f"Domain quota:          "
+        f"Domain quota:           "
         f"{args.domain_quota}"
     )
+
     log("=" * 70)
 
     # ------------------------------------------------------------------------
-    # Parallel collection
+    # Collect candidates and build the final corpus.
+    #
+    # We may need multiple collection rounds:
+    #
+    #   1. Collect 3x target.
+    #   2. Apply dedup + domain quota.
+    #   3. If fewer than target remain, collect another 3x target.
+    #   4. Repeat until target is reached or partitions are exhausted.
     # ------------------------------------------------------------------------
 
-    if pending:
+    while True:
 
-        with ThreadPoolExecutor(
-            max_workers=args.workers
-        ) as executor:
+        reached = collect_until_target(
+            state=state,
+            target_candidates=candidate_target,
+            workers=args.workers,
+            candidates_per_partition=(
+                args.candidates_per_partition
+            ),
+        )
 
-            futures = {
-                executor.submit(
-                    collect_partition,
-                    partition["id"],
-                    partition["url"],
-                    args.candidates_per_partition,
-                ): partition
+        if not reached:
+            log("")
+            log(
+                "All available partitions were "
+                "exhausted before reaching the "
+                "candidate target."
+            )
 
-                for partition
-                in pending
-            }
+        final_count = build_final_corpus(
+            target=args.target,
+            domain_quota=args.domain_quota,
+        )
 
-            for future in as_completed(
-                futures
-            ):
+        # Success.
+        if final_count >= args.target:
+            return
 
-                partition = futures[
-                    future
-                ]
+        # Check whether anything remains to collect.
+        remaining_partitions = [
+            partition
 
-                partition_id = partition[
-                    "id"
-                ]
+            for partition
+            in state["partitions"]
 
-                try:
+            if str(partition["id"])
+            not in state["completed"]
+        ]
 
-                    result = future.result()
+        if not remaining_partitions:
+            raise RuntimeError(
+                f"Unable to build the requested "
+                f"{args.target:,}-URL corpus. "
+                f"Only {final_count:,} URLs are "
+                f"eligible after the "
+                f"{args.domain_quota}-URL/domain "
+                f"quota, and all Common Crawl "
+                f"partitions have been exhausted."
+            )
 
-                    completed[
-                        str(partition_id)
-                    ] = result
+        # Add another full oversampled batch.
+        old_target = candidate_target
 
-                    # Checkpoint immediately after
-                    # every successfully completed shard.
-                    save_state(state)
-
-                    log(
-                        f"[checkpoint] "
-                        f"partition "
-                        f"{partition_id:04d} "
-                        f"saved"
-                    )
-
-                except Exception as exc:
-
-                    log(
-                        f"[partition "
-                        f"{partition_id:04d}] "
-                        f"FAILED: {exc}"
-                    )
-
-    # ------------------------------------------------------------------------
-    # Remaining partitions
-    # ------------------------------------------------------------------------
-
-    remaining = [
-        partition
-
-        for partition
-        in state["partitions"]
-
-        if str(partition["id"])
-        not in completed
-    ]
-
-    if remaining:
+        candidate_target += math.ceil(
+            args.target *
+            args.oversample
+        )
 
         log("")
         log(
-            f"{len(remaining)} partitions "
-            f"remain incomplete."
+            f"Final selection produced only "
+            f"{final_count:,} URLs. "
+            f"Expanding candidate target from "
+            f"{old_target:,} to "
+            f"{candidate_target:,}."
         )
-        log(
-            "Run the same command again "
-            "to resume."
-        )
-
-        return
-
-    # ------------------------------------------------------------------------
-    # Final corpus
-    # ------------------------------------------------------------------------
-
-    build_final_corpus(
-        target=args.target,
-        domain_quota=args.domain_quota,
-    )
 
 
 if __name__ == "__main__":
