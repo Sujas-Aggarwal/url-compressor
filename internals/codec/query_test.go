@@ -205,3 +205,61 @@ func TestQueryRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestQueryCodec(t *testing.T) {
+	tests := []string{
+		"a=1",
+		"page=2",
+		"id=12345",
+		"q=golang",
+		"debug",
+		"page=",
+		"foo=bar&debug",
+		"a=1&b=2&c=3",
+		"utm_source=google&utm_medium=cpc&utm_campaign=test&page=2",
+		"unknown_key=some_random_value",
+		"a=1&&b=2",
+	}
+
+	for _, input := range tests {
+		t.Run(input, func(t *testing.T) {
+			query, err := parseQuery(input)
+			if err != nil {
+				t.Fatalf("parseQuery() failed: %v", err)
+			}
+
+			writer := NewBitWriter()
+
+			if err := encodeQuery(writer, query); err != nil {
+				t.Fatalf("encodeQuery() failed: %v", err)
+			}
+
+			reader := NewBitReader(
+				writer.Bytes(),
+				writer.BitLen(),
+			)
+
+			decoded, err := decodeQuery(reader)
+			if err != nil {
+				t.Fatalf("decodeQuery() failed: %v", err)
+			}
+
+			got := decoded.String()
+
+			if got != input {
+				t.Fatalf(
+					"expected %q, got %q",
+					input,
+					got,
+				)
+			}
+
+			if reader.Remaining() != 0 {
+				t.Fatalf(
+					"expected 0 remaining bits, got %d",
+					reader.Remaining(),
+				)
+			}
+		})
+	}
+}
