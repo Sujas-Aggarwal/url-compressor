@@ -1,1 +1,12 @@
 bin/*
+*.md
+!README.md
+venv/*
+venv
+.venv
+.venv/*
+*.pyc
+__pycache__
+*.txt
+*.json
+*.csv
