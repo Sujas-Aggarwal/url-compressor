@@ -244,7 +244,7 @@ func main() {
 
 		if urls%1_000_000 == 0 {
 			fmt.Printf(
-				"processed %,d URLs | domain=%d path=%d query=%d\n",
+				"processed %d URLs | domain=%d path=%d query=%d\n",
 				urls,
 				len(domainCounts),
 				len(pathCounts),
@@ -321,13 +321,13 @@ func main() {
 	fmt.Println("========================================")
 	fmt.Println("MODEL TRAINED")
 	fmt.Println("========================================")
-	fmt.Printf("URLs:              %,d\n", urls)
-	fmt.Printf("Unique domain:     %,d\n", len(domainCounts))
-	fmt.Printf("Domain vocabulary: %,d\n", len(domainTokens))
-	fmt.Printf("Unique paths:      %,d\n", len(pathCounts))
-	fmt.Printf("Path vocabulary:   %,d\n", len(pathTokens))
-	fmt.Printf("Unique query keys:  %,d\n", len(queryCounts))
-	fmt.Printf("Query vocabulary:  %,d\n", len(queryTokens))
+	fmt.Printf("URLs:              %d\n", urls)
+	fmt.Printf("Unique domain:     %d\n", len(domainCounts))
+	fmt.Printf("Domain vocabulary: %d\n", len(domainTokens))
+	fmt.Printf("Unique paths:      %d\n", len(pathCounts))
+	fmt.Printf("Path vocabulary:   %d\n", len(pathTokens))
+	fmt.Printf("Unique query keys:  %d\n", len(queryCounts))
+	fmt.Printf("Query vocabulary:  %d\n", len(queryTokens))
 	fmt.Println()
 	fmt.Printf("Model: %s\n", *output)
 }

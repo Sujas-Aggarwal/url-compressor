@@ -286,7 +286,7 @@ func main() {
 
 		if lines%1_000_000 == 0 {
 			fmt.Printf(
-				"processed %,d URLs | %,d bytes\n",
+				"processed %d URLs | %d bytes\n",
 				lines,
 				stats.Total,
 			)
@@ -359,7 +359,7 @@ func main() {
 	fmt.Println("RESULT")
 	fmt.Println("========================================")
 
-	fmt.Printf("Total bytes: %,d\n", result.TotalBytes)
+	fmt.Printf("Total bytes: %d\n", result.TotalBytes)
 	fmt.Println()
 
 	fmt.Println("ENTROPY")
@@ -378,15 +378,15 @@ func main() {
 	fmt.Println()
 	fmt.Println("DISTINCT N-GRAMS")
 	fmt.Println("----------------------------------------")
-	fmt.Printf("Unigrams:   %,d\n",
+	fmt.Printf("Unigrams:   %d\n",
 		result.Distinct.Unigrams)
-	fmt.Printf("Bigrams:    %,d\n",
+	fmt.Printf("Bigrams:    %d\n",
 		result.Distinct.Bigrams)
-	fmt.Printf("Trigrams:   %,d\n",
+	fmt.Printf("Trigrams:   %d\n",
 		result.Distinct.Trigrams)
-	fmt.Printf("Fourgrams:  %,d\n",
+	fmt.Printf("Fourgrams:  %d\n",
 		result.Distinct.Fourgrams)
-	fmt.Printf("Fivegrams:  %,d\n",
+	fmt.Printf("Fivegrams:  %d\n",
 		result.Distinct.Fivegrams)
 
 	if *output != "" {

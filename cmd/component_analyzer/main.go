@@ -329,7 +329,7 @@ func main() {
 
 		if urls%1_000_000 == 0 {
 			fmt.Printf(
-				"processed %,d URLs\n",
+				"processed %d URLs\n",
 				urls,
 			)
 		}
@@ -366,7 +366,7 @@ func main() {
 		fmt.Printf("\n%-12s\n", strings.ToUpper(name))
 		fmt.Println("----------------------------------------")
 		fmt.Printf(
-			"bytes: %,d\n",
+			"bytes: %d\n",
 			result.Bytes,
 		)
 		fmt.Printf(
