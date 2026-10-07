@@ -3,51 +3,78 @@ package codec
 import "fmt"
 
 type RangeDecoder struct {
-	data   []byte
-	pos    int
-	code   uint64
-	range_ uint64
+	data []byte
+	pos  int
+
+	low  uint32
+	high uint32
+	code uint32
+
+	current byte
+	nBits   uint8
 }
 
 func NewRangeDecoder(data []byte) (*RangeDecoder, error) {
-	if len(data) < 8 {
+	if len(data) == 0 {
 		return nil, fmt.Errorf(
-			"range decoder: need at least 8 bytes, got %d",
-			len(data),
+			"range decoder: empty input",
 		)
 	}
 
 	d := &RangeDecoder{
-		data:   data,
-		range_: rangeMax,
+		data: data,
+		high: 0xFFFFFFFF,
 	}
 
-	for i := 0; i < 8; i++ {
-		d.code = (d.code << 8) | uint64(data[i])
+	for i := 0; i < 32; i++ {
+		d.code = (d.code << 1) | uint32(d.readBit())
 	}
-
-	d.pos = 8
 
 	return d, nil
 }
 
-// Get returns the cumulative-frequency position of the next symbol.
-//
-// IMPORTANT:
-// This does not modify decoder state.
-// Decode() must be called afterward with the selected interval.
+func (d *RangeDecoder) readBit() byte {
+	if d.nBits == 0 {
+		if d.pos >= len(d.data) {
+			// Zero-padding after the encoded stream is valid for
+			// the arithmetic decoder's final interval.
+			return 0
+		}
+
+		d.current = d.data[d.pos]
+		d.pos++
+		d.nBits = 8
+	}
+
+	bit := (d.current >> 7) & 1
+
+	d.current <<= 1
+	d.nBits--
+
+	return bit
+}
+
 func (d *RangeDecoder) Get(total uint64) (uint64, error) {
 	if total == 0 {
-		return 0, fmt.Errorf("range decoder: zero total frequency")
+		return 0, fmt.Errorf(
+			"range decoder: zero total frequency",
+		)
 	}
 
-	scaledRange := d.range_ / total
+	width := uint64(d.high-d.low) + 1
 
-	if scaledRange == 0 {
-		return 0, fmt.Errorf("range decoder: zero range")
+	// value is in [0,total).
+	value := ((uint64(d.code-d.low)+1)*total - 1) / width
+
+	if value >= total {
+		return 0, fmt.Errorf(
+			"range decoder: cumulative value %d >= total %d",
+			value,
+			total,
+		)
 	}
 
-	return d.code / scaledRange, nil
+	return value, nil
 }
 
 func (d *RangeDecoder) Decode(
@@ -56,41 +83,55 @@ func (d *RangeDecoder) Decode(
 	total uint64,
 ) error {
 	if total == 0 {
-		return fmt.Errorf("range decoder: zero total frequency")
+		return fmt.Errorf(
+			"range decoder: zero total frequency",
+		)
 	}
 
 	if cumLow >= cumHigh || cumHigh > total {
 		return fmt.Errorf(
-			"range decoder: invalid frequencies low=%d high=%d total=%d",
+			"range decoder: invalid interval [%d,%d) total=%d",
 			cumLow,
 			cumHigh,
 			total,
 		)
 	}
 
-	scaledRange := d.range_ / total
+	width := uint64(d.high-d.low) + 1
 
-	if scaledRange == 0 {
-		return fmt.Errorf("range decoder: zero range")
-	}
+	newLow := uint64(d.low) +
+		(width*cumLow)/total
 
-	d.code -= scaledRange * cumLow
-	d.range_ = scaledRange * (cumHigh - cumLow)
+	newHigh := uint64(d.low) +
+		(width*cumHigh)/total -
+		1
 
-	for d.range_ < rangeBottom {
-		if d.pos >= len(d.data) {
-			return fmt.Errorf(
-				"range decoder: unexpected end of input",
-			)
+	d.low = uint32(newLow)
+	d.high = uint32(newHigh)
+
+	for {
+		switch {
+		case d.high < rcHalf:
+			// Nothing to do.
+
+		case d.low >= rcHalf:
+			d.code -= rcHalf
+			d.low -= rcHalf
+			d.high -= rcHalf
+
+		case d.low >= rcFirst && d.high < rcThird:
+			d.code -= rcFirst
+			d.low -= rcFirst
+			d.high -= rcFirst
+
+		default:
+			return nil
 		}
 
-		d.code = (d.code << 8) | uint64(d.data[d.pos])
-		d.pos++
-
-		d.range_ <<= 8
+		d.low <<= 1
+		d.high = (d.high << 1) | 1
+		d.code = (d.code << 1) | uint32(d.readBit())
 	}
-
-	return nil
 }
 
 func (d *RangeDecoder) Position() int {
