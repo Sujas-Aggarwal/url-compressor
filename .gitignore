@@ -11,3 +11,4 @@ __pycache__
 *.json
 *.csv
 corpus/raw/*
+*.bin
