@@ -15,10 +15,20 @@ type URL struct {
 	Fragment string
 }
 
+type EncodedURL struct {
+	Flags    Flags
+	Scheme   string
+	Host     string
+	Port     uint16
+	Path     string
+	Query    string
+	Fragment string
+}
+
 func Encode(url string) string {
 	parsedUrl, _ := parse(url)
 	helper.CustomStructPrinter(parsedUrl)
-	return "Started Encoding"
+	return url
 }
 
 func parse(raw string) (*URL, error) {

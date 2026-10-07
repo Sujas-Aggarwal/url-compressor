@@ -14,3 +14,6 @@ encode: build
 
 decode: build
 	./bin/url_shortener decode '$(URL)'
+
+test:
+	go test ./...
