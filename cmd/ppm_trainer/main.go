@@ -356,6 +356,7 @@ func main() {
 	write(uint64(len(contexts)))
 
 	for _, context := range contexts {
+		write(context.order)
 		write(context.key)
 		write(context.total)
 		write(uint8(len(context.symbols)))
