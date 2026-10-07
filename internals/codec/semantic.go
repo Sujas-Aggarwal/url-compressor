@@ -10,7 +10,7 @@ func encodeSemantic(u *URL) *EncodedURL {
 
 	host := u.Host
 
-	// www. is redundant information that can be represented by one bit.
+	// "www." is common and can be represented by a single flag bit.
 	if strings.HasPrefix(strings.ToLower(host), "www.") {
 		flags |= FlagHasWWW
 		host = host[4:]
@@ -26,14 +26,17 @@ func encodeSemantic(u *URL) *EncodedURL {
 		}
 	}
 
+	// Path
 	if u.Path != "" {
 		flags |= FlagHasPath
 	}
 
+	// Query
 	if u.Query != "" {
 		flags |= FlagHasQuery
 	}
 
+	// Fragment
 	if u.Fragment != "" {
 		flags |= FlagHasFragment
 	}
@@ -63,16 +66,19 @@ func decodeSemantic(e *EncodedURL) *URL {
 	}
 
 	var path string
+
 	if e.Flags&FlagHasPath != 0 {
 		path = e.Path
 	}
 
 	var query string
+
 	if e.Flags&FlagHasQuery != 0 {
 		query = e.Query
 	}
 
 	var fragment string
+
 	if e.Flags&FlagHasFragment != 0 {
 		fragment = e.Fragment
 	}
